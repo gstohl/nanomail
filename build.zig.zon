@@ -1,0 +1,13 @@
+.{
+    .name = .nanomail,
+    .version = "0.1.0",
+    .fingerprint = 0xd47cd75392493380,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .nanoui = .{
+            .url = "git+https://github.com/justrach/nanoui#b6f9e6eb67f5502ccc15dc4f384770836b867f2e",
+            .hash = "nanoui-0.6.3-we0KMX_pEACtUUamGQRe1ofPzQe1H8WEBwdzfB-9UaTj",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

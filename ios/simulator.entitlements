@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The Simulator's keychain wants the app to name itself and its group,
+	     as a signed device app's provisioning profile does. -->
+	<key>application-identifier</key>
+	<string>NANOMAIL00.dev.nanomail.app</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>NANOMAIL00.dev.nanomail.app</string>
+	</array>
+</dict>
+</plist>
