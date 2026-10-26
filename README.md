@@ -192,3 +192,8 @@ Known limits:
   (`https://api.fastmail.com/jmap/session`).
 - A reply saved as a draft and sent later doesn't mark the original
   answered.
+
+## License
+
+nanomail is licensed under the [Zero-Clause BSD license](LICENSE) (0BSD).
+Dependencies and third-party components retain their respective licenses and rights.
