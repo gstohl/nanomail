@@ -131,6 +131,12 @@ pub const Client = struct {
             };
             switch (reply.status) {
                 200 => {
+                    // Found on another site, which wasn't sent the credentials:
+                    // its session would be sent them, so it's the user's to name.
+                    if (!send_auth) {
+                        c.say("The server sent sign-in on to {s}: enter its session URL to use it.", .{session_mod.host(url)});
+                        return error.NotJmap;
+                    }
                     const s = session_mod.parse(a, reply.body, url) catch |e| {
                         switch (e) {
                             // An anonymous session: the credentials weren't taken.

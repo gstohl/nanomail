@@ -61,6 +61,44 @@ test "credentials don't follow a redirect to another site" {
     try std.testing.expectEqualStrings("The server didn't accept this API token.", c.problem);
 }
 
+test "a session from another site, found without credentials, isn't taken" {
+    var canned: Canned = .{ .routes = &.{
+        .{ .url = "https://example.test/.well-known/jmap", .reply = .{ .status = 302, .location = "https://evil.test/jmap/session" } },
+        .{ .url = "https://evil.test/jmap/session", .reply = .{ .status = 200, .body = session_json } },
+        .{ .url = "https://evil.test/jmap/", .reply = .{ .status = 200, .body = "{\"methodResponses\":[]}" } },
+    } };
+    var c = jmap.Client.init(gpa, canned.transport());
+    defer c.deinit();
+    const connected = if (c.connect(.{ .username = "a@example.test", .secret = "pw" })) true else |_| false;
+    if (connected) {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        _ = c.identities(arena.allocator()) catch {};
+    }
+    for (canned.seen[0..@min(canned.count, canned.seen.len)]) |r| {
+        if (std.mem.startsWith(u8, r.url, "https://evil.test")) try std.testing.expect(r.auth == null);
+    }
+    try std.testing.expect(!connected);
+    try std.testing.expectEqualStrings("The server sent sign-in on to evil.test: enter its session URL to use it.", c.problem);
+}
+
+test "Fastmail's session, its downloads on another site, connects" {
+    var canned: Canned = .{ .routes = &.{
+        .{ .url = "https://api.fastmail.com/jmap/session", .reply = .{ .status = 200, .body =
+        \\{"capabilities":{"urn:ietf:params:jmap:core":{},"urn:ietf:params:jmap:mail":{}},
+        \\"accounts":{"u1":{"name":"a","accountCapabilities":{"urn:ietf:params:jmap:mail":{}}}},
+        \\"primaryAccounts":{"urn:ietf:params:jmap:mail":"u1"},"username":"a@fastmail.com",
+        \\"apiUrl":"https://api.fastmail.com/jmap/api/","uploadUrl":"https://api.fastmail.com/jmap/upload/{accountId}/",
+        \\"downloadUrl":"https://www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}",
+        \\"eventSourceUrl":"https://api.fastmail.com/jmap/event/","state":"s"}
+        } },
+    } };
+    var c = jmap.Client.init(gpa, canned.transport());
+    defer c.deinit();
+    try c.connect(.{ .server = "fastmail.com", .username = "a@fastmail.com", .secret = "tok", .token = true });
+    try std.testing.expect(std.mem.startsWith(u8, c.session.?.download_url, "https://www.fastmailusercontent.com/"));
+}
+
 test "an anonymous session means the password was wrong; no server, a clear word" {
     var canned: Canned = .{ .routes = &.{
         .{ .url = "http://127.0.0.1:9/jmap/session", .reply = .{ .status = 200, .body =
