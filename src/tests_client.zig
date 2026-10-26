@@ -82,6 +82,91 @@ test "a session from another site, found without credentials, isn't taken" {
     try std.testing.expectEqualStrings("The server sent sign-in on to evil.test: enter its session URL to use it.", c.problem);
 }
 
+test "discovery userinfo redirects never receive credentials or install a session" {
+    const target = "https://example.test:443@evil.test/session";
+    const uri = try std.Uri.parse(target);
+    try std.testing.expectEqualStrings("evil.test", uri.host.?.percent_encoded);
+    for ([_]bool{ false, true }) |token| {
+        var canned: Canned = .{ .routes = &.{
+            .{ .url = "https://example.test/.well-known/jmap", .reply = .{ .status = 302, .location = target } },
+            .{ .url = target, .reply = .{ .status = 200, .body = session_json } },
+        } };
+        var c = jmap.Client.init(gpa, canned.transport());
+        defer c.deinit();
+        const connected = if (c.connect(.{ .username = "a@example.test", .secret = "fixture", .token = token })) true else |_| false;
+        for (canned.seen[0..canned.count]) |req| {
+            if (std.mem.eql(u8, req.url, target)) try std.testing.expect(req.auth == null);
+        }
+        try std.testing.expect(!connected);
+        try std.testing.expect(c.session == null);
+        try std.testing.expectEqual(@as(usize, 1), canned.count);
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        try std.testing.expectError(error.NotConnected, c.identities(arena.allocator()));
+        try std.testing.expectError(error.NotConnected, c.download(arena.allocator(), "c", "b", "n", "text/plain"));
+        try std.testing.expectEqual(@as(usize, 1), canned.count);
+    }
+}
+
+test "discovery rejects malformed authorities before sending a request" {
+    for ([_][]const u8{
+        "https://user@example.test/session",        "https://example%2etest/session",
+        "https:///example.test",                    "https:/example.test",
+        "https:example.test",                       "ftp://example.test/session",
+        "HTTPS://example.test/session",             "https://[::1]junk:443/session",
+        "https://[::1/session",                     "https://example.test:+443/session",
+        "https://example.test\\@evil.test/session",
+    }) |target| {
+        var canned: Canned = .{ .routes = &.{
+            .{ .url = "https://example.test/.well-known/jmap", .reply = .{ .status = 307, .location = target } },
+            .{ .url = target, .reply = .{ .status = 200, .body = session_json } },
+        } };
+        var c = jmap.Client.init(gpa, canned.transport());
+        defer c.deinit();
+        try std.testing.expectError(error.NotJmap, c.connect(.{ .username = "a@example.test", .secret = "fixture" }));
+        try std.testing.expect(c.session == null);
+        try std.testing.expectEqual(@as(usize, 1), canned.count);
+        canned.count = 0;
+        try std.testing.expectError(error.NoServer, c.connect(.{ .server = target, .username = "a@example.test", .secret = "fixture" }));
+        try std.testing.expectEqual(@as(usize, 0), canned.count);
+    }
+}
+
+test "discovery trust stays lost after foreign IPv6 or downgrade hops" {
+    for ([_]struct { origin: []const u8, other: []const u8 }{
+        .{ .origin = "https://example.test/session", .other = "https://evil.test/session" },
+        .{ .origin = "https://example.test/session", .other = "http://example.test/session" },
+        .{ .origin = "https://[2001:db8::1]/session", .other = "https://[2001:db8::2]/session" },
+    }) |pair| {
+        var canned: Canned = .{ .routes = &.{
+            .{ .url = pair.origin, .reply = .{ .status = 302, .location = pair.other } },
+            .{ .url = pair.other, .reply = .{ .status = 308, .location = "https://example.test/final" } },
+            .{ .url = "https://example.test/final", .reply = .{ .status = 200, .body = session_json } },
+        } };
+        var c = jmap.Client.init(gpa, canned.transport());
+        defer c.deinit();
+        try std.testing.expectError(error.NotJmap, c.connect(.{ .server = pair.origin, .username = "a", .secret = "fixture", .token = true }));
+        try std.testing.expect(c.session == null);
+        try std.testing.expectEqual(@as(usize, 3), canned.count);
+        try std.testing.expect(canned.seen[1].auth == null and canned.seen[2].auth == null);
+    }
+}
+
+test "discovery trusts named servers and same-host or subdomain locations" {
+    for ([_][]const u8{ "/session", "session", "//mail.example.test/session", "https://mail.example.test/session" }) |location| {
+        var canned: Canned = .{ .routes = &.{
+            .{ .url = "https://example.test/start", .reply = .{ .status = 301, .location = location } },
+            .{ .url = "https://example.test/session", .reply = .{ .status = 200, .body = session_json } },
+            .{ .url = "https://mail.example.test/session", .reply = .{ .status = 200, .body = session_json } },
+        } };
+        var c = jmap.Client.init(gpa, canned.transport());
+        defer c.deinit();
+        try c.connect(.{ .server = "https://example.test/start", .username = "a@elsewhere.test", .secret = "fixture", .token = true });
+        try std.testing.expectEqual(@as(usize, 2), canned.count);
+        try std.testing.expectEqualStrings("Bearer fixture", canned.seen[1].auth.?);
+    }
+}
+
 test "Fastmail's session, its downloads on another site, connects" {
     var canned: Canned = .{ .routes = &.{
         .{ .url = "https://api.fastmail.com/jmap/session", .reply = .{ .status = 200, .body =
@@ -92,11 +177,16 @@ test "Fastmail's session, its downloads on another site, connects" {
         \\"downloadUrl":"https://www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}",
         \\"eventSourceUrl":"https://api.fastmail.com/jmap/event/","state":"s"}
         } },
+        .{ .url = "https://www.fastmailusercontent.com/jmap/download/u1/b/attachment?type=text%2Fplain", .reply = .{ .status = 200, .body = "fixture bytes" } },
     } };
     var c = jmap.Client.init(gpa, canned.transport());
     defer c.deinit();
     try c.connect(.{ .server = "fastmail.com", .username = "a@fastmail.com", .secret = "tok", .token = true });
     try std.testing.expect(std.mem.startsWith(u8, c.session.?.download_url, "https://www.fastmailusercontent.com/"));
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("fixture bytes", try c.download(arena.allocator(), "u1", "b", "attachment", "text/plain"));
+    try std.testing.expectEqualStrings("Bearer tok", canned.seen[1].auth.?);
 }
 
 test "an anonymous session means the password was wrong; no server, a clear word" {
@@ -345,18 +435,20 @@ fn fakeClock() i64 {
 }
 
 test "signed in through the browser: tokens renewed before they run out, and when refused" {
-    var script: Script = .{ .replies = &.{
-        // Launch: the refresh token kept buys an access token, then the session.
-        .{ .status = 200, .body = "{\"access_token\":\"A1\",\"token_type\":\"Bearer\",\"expires_in\":3600}" },
-        .{ .status = 200, .body = session_json },
-        // An hour on: renewed first; the server also replaces the refresh token.
-        .{ .status = 200, .body = "{\"access_token\":\"A2\",\"expires_in\":3600,\"refresh_token\":\"R2\"}" },
-        .{ .status = 200, .body = "{\"methodResponses\":[[\"Mailbox/get\",{\"list\":[]},\"c0\"]]}" },
-        // Refused early (revoked): renewed, sent again.
-        .{ .status = 401 },
-        .{ .status = 200, .body = "{\"access_token\":\"A3\",\"expires_in\":3600}" },
-        .{ .status = 200, .body = "{\"methodResponses\":[[\"Mailbox/get\",{\"list\":[]},\"c0\"]]}" },
-    } };
+    var script: Script = .{
+        .replies = &.{
+            // Launch: the refresh token kept buys an access token, then the session.
+            .{ .status = 200, .body = "{\"access_token\":\"A1\",\"token_type\":\"Bearer\",\"expires_in\":3600}" },
+            .{ .status = 200, .body = session_json },
+            // An hour on: renewed first; the server also replaces the refresh token.
+            .{ .status = 200, .body = "{\"access_token\":\"A2\",\"expires_in\":3600,\"refresh_token\":\"R2\"}" },
+            .{ .status = 200, .body = "{\"methodResponses\":[[\"Mailbox/get\",{\"list\":[]},\"c0\"]]}" },
+            // Refused early (revoked): renewed, sent again.
+            .{ .status = 401 },
+            .{ .status = 200, .body = "{\"access_token\":\"A3\",\"expires_in\":3600}" },
+            .{ .status = 200, .body = "{\"methodResponses\":[[\"Mailbox/get\",{\"list\":[]},\"c0\"]]}" },
+        },
+    };
     var c = jmap.Client.init(gpa, .{ .ctx = &script, .send = Script.send });
     defer c.deinit();
     c.clock = fakeClock;

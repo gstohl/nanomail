@@ -137,21 +137,69 @@ pub fn origin(url: []const u8) []const u8 {
     return url[0..end];
 }
 
-/// The host of a URL, without its port.
+const Authority = struct { host: []const u8, tls: bool };
+
+/// A conservative HTTP(S) authority, parsed as std.http parses it. Reject
+/// userinfo and encoded hosts instead of letting transports interpret them
+/// differently. The port must consume the entire suffix (Uri is lenient).
+fn authority(url: []const u8) ?Authority {
+    for (url) |ch| if (ch <= ' ' or ch == 0x7f or ch == '\\') return null;
+    const uri = std.Uri.parse(url) catch return null;
+    const tls = std.mem.eql(u8, uri.scheme, "https");
+    if (!tls and !std.mem.eql(u8, uri.scheme, "http")) return null;
+    if (!std.mem.startsWith(u8, url[uri.scheme.len..], "://")) return null;
+    if (uri.user != null or uri.password != null) return null;
+    const h = (uri.host orelse return null).percent_encoded;
+    if (h.len == 0 or std.mem.indexOfScalar(u8, h, '%') != null) return null;
+    const start = uri.scheme.len + 3;
+    const end = std.mem.indexOfAnyPos(u8, url, start, "/?#") orelse url.len;
+    if (!std.mem.startsWith(u8, url[start..end], h)) return null;
+    const suffix = url[start + h.len .. end];
+    if (suffix.len > 0) {
+        if (suffix[0] != ':' or suffix.len == 1 or uri.port == null or uri.port.? == 0) return null;
+        for (suffix[1..]) |ch| if (!std.ascii.isDigit(ch)) return null;
+    }
+    if (h[0] == '[') {
+        if (h[h.len - 1] != ']') return null;
+        _ = std.Io.net.Ip6Address.parse(h[1 .. h.len - 1], 0) catch return null;
+    } else {
+        std.Io.net.HostName.validate(h) catch return null;
+        // Reject shortened, octal and hex IPv4 spellings: platforms differ.
+        if (isAddress(h)) _ = std.Io.net.Ip4Address.parse(h, 0) catch return null;
+    }
+    return .{ .host = h, .tls = tls };
+}
+
+/// A validated host, without its port, or empty for an unsafe URL.
 pub fn host(url: []const u8) []const u8 {
-    const o = origin(url);
-    const s = if (std.mem.indexOf(u8, o, "://")) |i| i + 3 else 0;
-    const h = o[s..];
-    return h[0 .. std.mem.lastIndexOfScalar(u8, h, ':') orelse h.len];
+    return if (authority(url)) |a| a.host else "";
+}
+
+/// Discovery redirects only: validate before the path resolver can turn a
+/// malformed scheme into a path on the trusted server. Network paths inherit
+/// only the scheme; the resulting authority still has to earn trust.
+pub fn redirectUrl(arena: std.mem.Allocator, base: []const u8, location: []const u8) ![]const u8 {
+    if (location.len == 0 or authority(base) == null) return error.NotJmap;
+    const first_end = std.mem.indexOfAny(u8, location, "/?#") orelse location.len;
+    if (std.mem.indexOfScalar(u8, location[0..first_end], ':') != null and
+        std.mem.indexOf(u8, location, "://") == null) return error.NotJmap;
+    const next = if (std.mem.startsWith(u8, location, "//"))
+        try std.mem.concat(arena, u8, &.{ base[0..std.mem.indexOfScalar(u8, base, ':').?], ":", location })
+    else
+        try resolve(arena, base, location);
+    if (authority(next) == null) return error.NotJmap;
+    return next;
 }
 
 /// Whether credentials may follow a redirect from `a` to `b`: to the
 /// same host, or into a subdomain of it (example.com to
 /// mail.example.com), never between addresses or from https to http.
 pub fn sameSite(a: []const u8, b: []const u8) bool {
-    if (std.mem.startsWith(u8, a, "https:") and !std.mem.startsWith(u8, b, "https:")) return false;
-    const ha = host(a);
-    const hb = host(b);
+    const aa = authority(a) orelse return false;
+    const ab = authority(b) orelse return false;
+    if (aa.tls and !ab.tls) return false;
+    const ha = aa.host;
+    const hb = ab.host;
     if (std.ascii.eqlIgnoreCase(ha, hb)) return true;
     if (isAddress(ha) or isAddress(hb)) return false;
     return hb.len > ha.len + 1 and std.ascii.endsWithIgnoreCase(hb, ha) and hb[hb.len - ha.len - 1] == '.';
@@ -160,7 +208,13 @@ pub fn sameSite(a: []const u8, b: []const u8) bool {
 /// An IP address rather than a name.
 fn isAddress(h: []const u8) bool {
     if (std.mem.indexOfScalar(u8, h, ':') != null or (h.len > 0 and h[0] == '[')) return true;
-    for (h) |ch| if (!std.ascii.isDigit(ch) and ch != '.') return false;
+    var labels = std.mem.splitScalar(u8, std.mem.trimEnd(u8, h, "."), '.');
+    while (labels.next()) |label| {
+        const hex = std.ascii.startsWithIgnoreCase(label, "0x");
+        const digits = if (hex) label[2..] else label;
+        if (digits.len == 0) return false;
+        for (digits) |ch| if (if (hex) !std.ascii.isHex(ch) else !std.ascii.isDigit(ch)) return false;
+    }
     return true;
 }
 
@@ -224,6 +278,77 @@ test "urls" {
         "http://h/download/u1/B%2F1/my%20file.pdf?accept=application%2Fpdf",
         try downloadUrl(a, "http://h/download/{accountId}/{blobId}/{name}?accept={type}", "u1", "B/1", "my file.pdf", "application/pdf"),
     );
+}
+
+test "discovery authorities fail closed across parser boundaries" {
+    const good = "https://example.test/session";
+    for ([_][]const u8{
+        "https://example.test:443@evil.test/session",
+        "https://user@example.test/session",
+        "https://@example.test/session",
+        "https://example.test%40evil.test/session",
+        "https://%65xample.test/session",
+        "https://example%2etest/session",
+        "https://example.test%00.evil.test/session",
+        "https://example.test\\@evil.test/session",
+        "https://example.test/\r\n",
+        "https:///session",
+        "https://",
+        "https:/example.test",
+        "https:example.test",
+        "//example.test/session",
+        "ftp://example.test/session",
+        "wss://example.test/session",
+        "HTTPS://example.test/session",
+        "https://example.test:/session",
+        "https://example.test:+443/session",
+        "https://example.test:4_43/session",
+        "https://example.test:65536/session",
+        "https://example.test:0/session",
+        "https://example..test/session",
+        "https://-example.test/session",
+        "https://[::1]evil.test/session",
+        "https://[::1]junk:443/session",
+        "https://[::1/session",
+        "https://[not-an-ip]/session",
+        "https://::1/session",
+        "https://[fe80::1%25en0]/session",
+        "https://127.1/session",
+        "https://0177.0.0.1/session",
+        "https://2130706433/session",
+        "https://0x7f000001/session",
+        "https://127.0.0.1./session",
+        "https://0x7f000001./session",
+    }) |bad| {
+        try std.testing.expectEqualStrings("", host(bad));
+        try std.testing.expect(!sameSite(good, bad));
+        try std.testing.expect(!sameSite(bad, good));
+        try std.testing.expect(!sameSite(bad, bad));
+    }
+    try std.testing.expectEqualStrings("example.test", host("https://example.test?next=@evil.test:99"));
+    try std.testing.expectEqualStrings("[2001:db8::1]", host("https://[2001:db8::1]:8443/session"));
+    try std.testing.expect(sameSite(good, "https://MAIL.EXAMPLE.TEST:8443/session"));
+    try std.testing.expect(sameSite(good, "https://example.test/a%20b?next=@evil.test:99#end"));
+    try std.testing.expect(sameSite("http://example.test/s", good));
+    try std.testing.expect(!sameSite(good, "http://example.test/s"));
+    try std.testing.expect(sameSite("https://[2001:db8::1]/s", "https://[2001:DB8::1]:8443/s"));
+    try std.testing.expect(!sameSite("https://[2001:db8::1]/s", "https://[2001:db8::2]/s"));
+    try std.testing.expect(!sameSite("https://[::ffff:127.0.0.1]/s", "https://[::ffff:127.0.0.2]/s"));
+    try std.testing.expect(sameSite("http://127.0.0.1:8080/s", "http://127.0.0.1:8081/s"));
+    try std.testing.expect(!sameSite("http://127.0.0.1/s", "http://mail.127.0.0.1/s"));
+}
+
+test "discovery locations keep authority distinct from relative paths" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "https://example.test/jmap/session";
+    try std.testing.expectEqualStrings("https://example.test/next", try redirectUrl(a, base, "/next"));
+    try std.testing.expectEqualStrings("https://example.test/jmap/next", try redirectUrl(a, base, "next"));
+    try std.testing.expectEqualStrings("https://evil.test/session", try redirectUrl(a, base, "//evil.test/session"));
+    for ([_][]const u8{ "", "https:evil.test", "https:/evil.test", "https:///evil.test", "mailto:a@example.test", "//example.test:443@evil.test/session", "///evil.test/session", "\\\\evil.test/session" }) |loc| {
+        try std.testing.expectError(error.NotJmap, redirectUrl(a, base, loc));
+    }
 }
 
 test "session objects" {

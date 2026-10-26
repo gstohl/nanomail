@@ -118,6 +118,10 @@ pub const Client = struct {
             c.say("Enter the server's address.", .{});
             return error.NoServer;
         };
+        if (session_mod.host(url).len == 0) {
+            c.say("Enter an HTTP or HTTPS server URL without user information.", .{});
+            return error.NoServer;
+        }
         var send_auth = true;
         var hops: u8 = 0;
         while (true) : (hops += 1) {
@@ -153,7 +157,10 @@ pub const Client = struct {
                 },
                 301, 302, 303, 307, 308 => {
                     const loc = reply.location orelse return error.NotJmap;
-                    const next = try session_mod.resolve(a, url, loc);
+                    const next = session_mod.redirectUrl(a, url, loc) catch |e| {
+                        c.say("The server returned an invalid sign-in URL.", .{});
+                        return e;
+                    };
                     send_auth = send_auth and session_mod.sameSite(url, next);
                     url = next;
                 },
